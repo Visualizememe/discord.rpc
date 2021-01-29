@@ -13,11 +13,11 @@ jobs:
             - run: npm ci
             - run: npm install jest --save-dev
             - run: npm run build
-            - run: npm run test
+            - run: npm run tests
       - codecov/upload:
           file: "./coverage/clover.xml"
           token: bc55e615-594b-40a3-bf51-3e408a8e5f85
 workflows:
   build-and-test:
     jobs:
-      - build-and-test
+      - build-and-tests
