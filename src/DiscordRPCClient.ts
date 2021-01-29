@@ -1,7 +1,7 @@
 import debug from "debug";
 import { DISCORD_API_ENDPOINT, RPCCommand, RPCCommands, RPCEvent, RPCEvents } from "./constants";
 import IPCTransport from "./transports/IPCTransport";
-import { uuid4122 } from "./util";
+import { getPID, uuid4122 } from "./util";
 import EventEmitter = require("events");
 
 
@@ -35,8 +35,113 @@ type DiscordRPCClientOptions = {
     scopes?: (DiscordScope | string)[];
     accessToken?: string;
 }
+type ActivityOptions = {
+    state: string;
+    details: string;
+    instance: boolean;
+    timestamps?: {
+        start: number;
+        end: number;
+    };
+    assets: {
+        largeImage?: string;
+        largeText?: string;
+        smallImage?: string;
+        smallText?: string;
+    };
+    party?: {
+        size: number;
+        id: any;
+        max: number;
+    };
+    secrets?: {
+        match?: any;
+        join?: any;
+        spectate?: any;
+    };
+}
 
-export default class DiscordRPCClient extends EventEmitter {
+type KNOWN_EVENT_MESSAGES = {
+    MESSAGE_CREATE: {
+        channel_id: string;
+        message: {};
+    }
+};
+
+type UserVoiceSettings = {
+    pan: any;
+    volume: number;
+    mute: boolean;
+}
+
+
+declare interface DiscordRPCClient extends EventEmitter {
+    on (event: "MESSAGE_CREATE", handler: (data: KNOWN_EVENT_MESSAGES["MESSAGE_CREATE"]) => void): this;
+}
+
+
+/**
+ * Changes the phrasing of a key to either camel or snake case
+ * For example, if "to" is set to "snake" and you pass "helloWorld", the result will be "hello_world"
+ * If you set "to" to "camel" and pass "hello_there" it will return "helloThere"
+ * @param {"camel" | "snake"} to
+ * @param {string} text
+ * @returns {string}
+ */
+const togglePhraseCase = (to: "camel" | "snake", text: string): string => {
+    let fixedPhrase = "";
+    
+    for (let i = 0; i < text.length; i++) {
+        const char = text.charAt(i);
+        let fixed = char;
+        
+        if (to === "snake") {
+            if (char === char.toUpperCase()) {
+                // If this character is an uppercase
+                fixed = `_${ char.toLowerCase() }`;
+            }
+        } else if (to === "camel") {
+            if (char === "_") {
+                fixed = "";
+            } else {
+                const prevChar = text.charAt(i - 1) || "";
+                
+                if (prevChar === "_") {
+                    fixed = char.toUpperCase();
+                }
+            }
+        }
+        
+        fixedPhrase += fixed;
+    }
+    
+    return fixedPhrase;
+};
+
+/**
+ * Goes through every entry in the object provided and turns the name into to "to" case format.
+ * If an entry is an object it will call itself recursively
+ * @param {"camel" | "snake"} to
+ * @param {Record<any, any>} object
+ * @returns {Record<any, any>}
+ */
+const togglePhraseInObject = (to: "camel" | "snake", object: Record<any, any>): Record<any, any> => {
+    const newObject: Record<any, any> = {};
+    
+    for (const entry of Object.entries(object)) {
+        const updatedEntryKey = togglePhraseCase(to, entry[0]);
+        if (typeof entry[1] === "object") {
+            newObject[updatedEntryKey] = togglePhraseInObject(to, entry[1]);
+        } else {
+            newObject[updatedEntryKey] = entry[1];
+        }
+    }
+    
+    return newObject;
+};
+
+
+class DiscordRPCClient extends EventEmitter {
     /**
      * The endpoint used for API requests
      * @type {string}
@@ -64,23 +169,52 @@ export default class DiscordRPCClient extends EventEmitter {
      * @type {string | null}
      */
     public clientSecret: string | null;
+    /**
+     * The redirect URI for OAuth2
+     * @type {string | null}
+     */
     public redirectUri: string | null;
+    /**
+     * The already-retrieved access-token after a user finishes OAuth2
+     * @type {string | null}
+     */
     public accessToken: string | null;
+    /**
+     * After calling DiscordRPCClient.login() this will be available
+     * @type {unknown}
+     */
     public user: unknown | null;
-
+    
+    /**
+     * Used for debugging purposes, set DEBUG=DiscordRPCClient* to enable debugging logs
+     * @type {debug.Debugger}
+     */
     public debugger: debug.Debugger;
-
+    
+    /**
+     * When doing sendCommand we expect a response from Discord with the nonce, this
+     * Map will be waiting for a response from Discord with the given nonce
+     * @type {Map<string, {resolve: (...args: any[]) => unknown, reject: (error: any) => unknown}>}
+     */
     public pendingResponses: Map<string, { resolve: (...args: any[]) => unknown, reject: (error: any) => unknown }>;
-    public eventHandlers: Map<string, (...args: any[]) => void>;
-
+    
+    /**
+     * If we're connecting to the socket with either IPCTransport or WebSocket this is the promise for that
+     * function connecting.
+     * @type {Promise<void> | null}
+     * @private
+     */
     private connectingPromise: Promise<void> | null;
-
-
+    
+    /**
+     * Creates a new DiscordRPCClient
+     * @param {DiscordRPCClientOptions} options
+     */
     constructor (options: DiscordRPCClientOptions) {
         if (options.transport !== "ipc" && options.transport !== "websocket") {
             throw new Error(`You can only use either "ipc" or "websocket" as transport!`);
         }
-
+        
         super();
         this.apiEndpoint = DISCORD_API_ENDPOINT;
         this.debugger = debug("DiscordRPCClient");
@@ -92,84 +226,99 @@ export default class DiscordRPCClient extends EventEmitter {
         this.redirectUri = options.redirectUri ? encodeURIComponent(decodeURIComponent(options.redirectUri)) : null;
         this.accessToken = options.accessToken || null;
         this.user = null;
-
+        
         this.pendingResponses = new Map();
-        this.eventHandlers = new Map();
-
+        
         this.connectingPromise = null;
     }
-
+    
+    /**
+     * Connects to the socket through the provided transport type
+     * @returns {Promise<void>}
+     */
     connect (): Promise<void> {
         if (this.connectingPromise) {
             return this.connectingPromise as Promise<void>;
         }
-
+        
         this.connectingPromise = new Promise<void>((resolve, reject) => {
             const defaultTimeout = setTimeout(() => reject(new Error(`RPC_CONNECTION_TIMEOUT`)), 10000);
             defaultTimeout.unref();
-
+            
             const quitConnecting = (e?: Error) => {
                 clearTimeout(defaultTimeout);
                 if (e) {
                     return reject(e);
                 }
             };
-
+            
             this.once("connected", () => {
                 this.debugger(`Successfully connected to socket!`);
                 quitConnecting();
                 resolve();
             });
-
+            
             this.transport.once("error", (error: Error) => {
                 this.debugger(`Encountered an error!`);
                 this.debugger(error);
                 throw error;
             });
-
+            
             this.transport.once("close", () => {
                 this.debugger(`Socket closed!`);
-
+                
                 quitConnecting();
                 this.pendingResponses.forEach(pending => {
                     pending.reject(new Error("Connection closed"));
                 });
-
+                
                 this.emit("disconnected");
-
+                
                 reject(new Error("Connection closed"));
             });
-
+            
             this.debugger(`Binding received messages to DiscordRPCClient.onRPCMessage()`);
             this.transport.on("message", this.onRPCMessage.bind(this));
-
+            
             this.debugger(`Attempting to connect..`);
             return this.transport.connect()
                 .catch(reject);
         });
-
+        
         return this.connectingPromise;
     }
-
+    
+    /**
+     * Sends a http request
+     * @param {string} method
+     * @param {string} path
+     * @param {{data: any, query: any}} options
+     * @returns {Promise<any>}
+     */
     sendRequest (method: string, path: string, options: { data: any, query: any }) {
-        return fetch(`${this.apiEndpoint}${path}${options.query ? new URLSearchParams(options.query) : ""}`, {
+        return fetch(`${ this.apiEndpoint }${ path }${ options.query ? new URLSearchParams(options.query) : "" }`, {
             method,
             body: options.data,
             headers: {
-                Authorization: `Bearer ${this.accessToken}`
+                Authorization: `Bearer ${ this.accessToken }`
             }
         })
             .then(async response => {
                 const parsedBody = await response.json();
-
+                
                 if (!response.ok) {
-                    throw new Error(`Error sending request to ${path}: Status ${response.status} - ${response.statusText || "N/A"}.`);
+                    throw new Error(`Error sending request to ${ path }: Status ${ response.status } - ${ response.statusText || "N/A" }.`);
                 }
-
+                
                 return parsedBody;
             });
     }
-
+    
+    /**
+     * Logs in using the access token of a user through the given transport type
+     * @param {string} accessToken
+     * @returns {Promise<void>}
+     */
     async login (accessToken?: string) {
         this.debugger(`Attempting to authenticate, waiting for socket to connect..`);
         await this.connect();
@@ -178,80 +327,151 @@ export default class DiscordRPCClient extends EventEmitter {
             access_token: accessToken || this.accessToken
         })
             .then(response => {
-                this.debugger(`Authentication response: ${JSON.stringify(response)}`);
+                this.debugger(`Authentication response: ${ JSON.stringify(response) }`);
                 this.emit("ready");
             });
     }
-
-    sendCommand (command: RPCCommand, args: any, event?: RPCEvent) {
-        this.debugger(`Send Command: ${command}, args: ${JSON.stringify(args)}, event: ${event}`);
-
+    
+    /**
+     * Sends a command to the currently connected socket
+     * @param {RPCCommand} command
+     * @param args
+     * @param {RPCEvent} event
+     * @returns {Promise<unknown>}
+     */
+    sendCommand (command: RPCCommand, args: any, event?: RPCEvent): Promise<void> {
+        this.debugger(`Send Command: ${ command }, args: ${ JSON.stringify(args) }, event: ${ event }`);
+        
         return new Promise((resolve, reject) => {
             const generatedNonce = uuid4122();
-
+            
             this.transport.send({
                 cmd: command,
                 args,
                 evt: event || undefined,
                 nonce: generatedNonce
             });
-
+            
             this.pendingResponses.set(generatedNonce, {
                 resolve,
                 reject
             });
         });
     }
-
-    subscribe (event: RPCEvent, args: any, handler: (...args: any) => void): Promise<{ unsubscribe: () => void }> {
+    
+    subscribe (event: RPCEvent, args: any): Promise<void> {
+        this.debugger(`Subscribing to "${ event }"`);
         return this.sendCommand(RPCCommands.SUBSCRIBE, args, event)
             .then(() => {
-                const eventSubscriptionKey = `${event}${JSON.stringify(args)}`;
-                this.eventHandlers.set(eventSubscriptionKey, handler);
-
-                return {
-                    unsubscribe: () => {
-                        this.sendCommand(RPCCommands.UNSUBSCRIBE, args, event)
-                            .then(() => {
-                                this.eventHandlers.delete(eventSubscriptionKey);
-                            });
-                    }
-                };
+                this.debugger(`Sent command to subscribe to event "${ event }"`);
             });
     }
-
-    public createEventKey (event: string, args: any) {
-        return `${event}${JSON.stringify(args)}`;
+    
+    getGuild (id: string, timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.GET_GUILD, {
+            guild_id: id,
+            timeout: timeout || 10000
+        });
     }
-
+    
+    getGuilds (timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.GET_GUILDS, {
+            timeout: timeout || 10000
+        });
+    }
+    
+    getChannel (id: string, timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.GET_CHANNELS, {
+            channel_id: id,
+            timeout: timeout || 10000
+        });
+    }
+    
+    getChannelsInGuild (guildId: string, timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.GET_CHANNELS, {
+            guild_id: guildId,
+            timeout: timeout || 10000
+        });
+    }
+    
+    setUserVoiceSettings (userId: string, settings: UserVoiceSettings): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SET_USER_VOICE_SETTINGS, {
+            user_id: userId,
+            ...settings
+        });
+    }
+    
+    selectVoiceChannel (id: string, force?: boolean, timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SELECT_VOICE_CHANNEL, {
+            channel_id: id,
+            force: force || false,
+            timeout: timeout || 10000
+        });
+    }
+    
+    selectTextChannel (id: string, timeout?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SELECT_TEXT_CHANNEL, {
+            channel_id: id,
+            timeout: timeout || 10000
+        });
+    }
+    
+    getVoiceSettings () {
+        return this.sendCommand(RPCCommands.GET_VOICE_SETTINGS, {})
+            .then(result => {
+                this.debugger(result);
+                return togglePhraseInObject("camel", result as unknown as Record<any, any>);
+            });
+    }
+    
+    public setActivity (activity: ActivityOptions, pid?: number): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SET_ACTIVITY, {
+            pid: pid || getPID() || 1,
+            activity: {
+                state: activity.state,
+                details: activity.details,
+                timestamps: activity.timestamps,
+                assets: togglePhraseInObject("snake", activity.assets || {}),
+                party: activity.party ? {
+                    id: activity.party.id,
+                    size: [ activity.party.size, activity.party.max ]
+                } : undefined,
+                secrets: activity.secrets,
+                instance: activity.instance
+            }
+        });
+    }
+    
+    /**
+     * Internal handling of RPC messages received
+     * @param message
+     * @returns {unknown}
+     * @private
+     */
     private onRPCMessage (message: any) {
         if (message.cmd === RPCCommands.DISPATCH && message.evt === RPCEvents.READY) {
             if (message.data && message.data.user) {
                 this.user = message.data.user;
             }
-
+            
             // We're connected :)
             this.emit("connected");
         } else if (this.pendingResponses.has(message.nonce)) {
-            this.debugger(`Incoming message had pending response handler, nonce: ${message.nonce}`);
+            this.debugger(`Incoming message had pending response handler, nonce: ${ message.nonce }`);
             const foundResponseHandler = this.pendingResponses.get(message.nonce);
-
+            
             if (message.evt === "ERROR") {
                 const createdError = new Error(message.data.message);
-
+                
                 return foundResponseHandler!.reject(createdError);
             }
-
+            
             foundResponseHandler!.resolve(message.data);
         } else {
-            const eventSubscriptionKey = `${message.evt}${JSON.stringify(message.args)}`;
-
-            if (!this.eventHandlers.has(eventSubscriptionKey)) {
-                this.debugger(`No event handler for event key: ${eventSubscriptionKey}`);
-                return;
-            }
-
-            this.eventHandlers.get(eventSubscriptionKey)!(message.data);
+            this.emit(message.evt as RPCEvent, message.data);
         }
     }
 }
+
+
+export default DiscordRPCClient;
