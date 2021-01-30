@@ -1,5 +1,5 @@
 import debug from "debug";
-import { DISCORD_API_ENDPOINT, RPCCommand, RPCCommands, RPCEvent, RPCEvents } from "./constants";
+import { DISCORD_API_ENDPOINT, RelationshipTypes, RPCCommand, RPCCommands, RPCEvent, RPCEvents } from "./constants";
 import IPCTransport from "./transports/IPCTransport";
 import { getPID, uuid4122 } from "./util";
 import EventEmitter = require("events");
@@ -65,13 +65,43 @@ type KNOWN_EVENT_MESSAGES = {
     MESSAGE_CREATE: {
         channel_id: string;
         message: {};
+    };
+    MESSAGE_UPDATE: KNOWN_EVENT_MESSAGES["MESSAGE_CREATE"];
+};
+type VoiceSettings = {
+    automaticGainControl: unknown;
+    echoCancellation: boolean;
+    noiseSuppression: boolean;
+    qos: unknown;
+    silenceWarning: unknown;
+    deaf: boolean;
+    mute: boolean;
+    input?: {
+        deviceId: unknown;
+        volume: unknown;
+    };
+    output?: {
+        deviceId: unknown;
+        volume: unknown;
+    };
+    mode?: {
+        mode: unknown;
+        autoThreshold: unknown;
+        threshold: unknown;
+        shortcut: unknown;
+        delay: unknown
     }
 };
-
 type UserVoiceSettings = {
     pan: any;
     volume: number;
     mute: boolean;
+}
+type PartialUser = {
+    id: string;
+    username: string;
+    discriminator: string;
+    avatar: string | undefined;
 }
 
 
@@ -90,31 +120,31 @@ declare interface DiscordRPCClient extends EventEmitter {
  */
 const togglePhraseCase = (to: "camel" | "snake", text: string): string => {
     let fixedPhrase = "";
-    
+
     for (let i = 0; i < text.length; i++) {
         const char = text.charAt(i);
         let fixed = char;
-        
+
         if (to === "snake") {
             if (char === char.toUpperCase()) {
                 // If this character is an uppercase
-                fixed = `_${ char.toLowerCase() }`;
+                fixed = `_${char.toLowerCase()}`;
             }
         } else if (to === "camel") {
             if (char === "_") {
                 fixed = "";
             } else {
                 const prevChar = text.charAt(i - 1) || "";
-                
+
                 if (prevChar === "_") {
                     fixed = char.toUpperCase();
                 }
             }
         }
-        
+
         fixedPhrase += fixed;
     }
-    
+
     return fixedPhrase;
 };
 
@@ -127,7 +157,7 @@ const togglePhraseCase = (to: "camel" | "snake", text: string): string => {
  */
 const togglePhraseInObject = (to: "camel" | "snake", object: Record<any, any>): Record<any, any> => {
     const newObject: Record<any, any> = {};
-    
+
     for (const entry of Object.entries(object)) {
         const updatedEntryKey = togglePhraseCase(to, entry[0]);
         if (typeof entry[1] === "object") {
@@ -136,7 +166,7 @@ const togglePhraseInObject = (to: "camel" | "snake", object: Record<any, any>): 
             newObject[updatedEntryKey] = entry[1];
         }
     }
-    
+
     return newObject;
 };
 
@@ -183,21 +213,21 @@ class DiscordRPCClient extends EventEmitter {
      * After calling DiscordRPCClient.login() this will be available
      * @type {unknown}
      */
-    public user: unknown | null;
-    
+    public user: PartialUser | null;
+
     /**
      * Used for debugging purposes, set DEBUG=DiscordRPCClient* to enable debugging logs
      * @type {debug.Debugger}
      */
     public debugger: debug.Debugger;
-    
+
     /**
      * When doing sendCommand we expect a response from Discord with the nonce, this
      * Map will be waiting for a response from Discord with the given nonce
      * @type {Map<string, {resolve: (...args: any[]) => unknown, reject: (error: any) => unknown}>}
      */
     public pendingResponses: Map<string, { resolve: (...args: any[]) => unknown, reject: (error: any) => unknown }>;
-    
+
     /**
      * If we're connecting to the socket with either IPCTransport or WebSocket this is the promise for that
      * function connecting.
@@ -205,7 +235,7 @@ class DiscordRPCClient extends EventEmitter {
      * @private
      */
     private connectingPromise: Promise<void> | null;
-    
+
     /**
      * Creates a new DiscordRPCClient
      * @param {DiscordRPCClientOptions} options
@@ -214,7 +244,7 @@ class DiscordRPCClient extends EventEmitter {
         if (options.transport !== "ipc" && options.transport !== "websocket") {
             throw new Error(`You can only use either "ipc" or "websocket" as transport!`);
         }
-        
+
         super();
         this.apiEndpoint = DISCORD_API_ENDPOINT;
         this.debugger = debug("DiscordRPCClient");
@@ -226,12 +256,12 @@ class DiscordRPCClient extends EventEmitter {
         this.redirectUri = options.redirectUri ? encodeURIComponent(decodeURIComponent(options.redirectUri)) : null;
         this.accessToken = options.accessToken || null;
         this.user = null;
-        
+
         this.pendingResponses = new Map();
-        
+
         this.connectingPromise = null;
     }
-    
+
     /**
      * Connects to the socket through the provided transport type
      * @returns {Promise<void>}
@@ -240,54 +270,54 @@ class DiscordRPCClient extends EventEmitter {
         if (this.connectingPromise) {
             return this.connectingPromise as Promise<void>;
         }
-        
+
         this.connectingPromise = new Promise<void>((resolve, reject) => {
             const defaultTimeout = setTimeout(() => reject(new Error(`RPC_CONNECTION_TIMEOUT`)), 10000);
             defaultTimeout.unref();
-            
+
             const quitConnecting = (e?: Error) => {
                 clearTimeout(defaultTimeout);
                 if (e) {
                     return reject(e);
                 }
             };
-            
+
             this.once("connected", () => {
                 this.debugger(`Successfully connected to socket!`);
                 quitConnecting();
                 resolve();
             });
-            
+
             this.transport.once("error", (error: Error) => {
                 this.debugger(`Encountered an error!`);
                 this.debugger(error);
                 throw error;
             });
-            
+
             this.transport.once("close", () => {
                 this.debugger(`Socket closed!`);
-                
+
                 quitConnecting();
                 this.pendingResponses.forEach(pending => {
                     pending.reject(new Error("Connection closed"));
                 });
-                
+
                 this.emit("disconnected");
-                
+
                 reject(new Error("Connection closed"));
             });
-            
+
             this.debugger(`Binding received messages to DiscordRPCClient.onRPCMessage()`);
             this.transport.on("message", this.onRPCMessage.bind(this));
-            
+
             this.debugger(`Attempting to connect..`);
             return this.transport.connect()
                 .catch(reject);
         });
-        
+
         return this.connectingPromise;
     }
-    
+
     /**
      * Sends a http request
      * @param {string} method
@@ -296,30 +326,30 @@ class DiscordRPCClient extends EventEmitter {
      * @returns {Promise<any>}
      */
     sendRequest (method: string, path: string, options: { data: any, query: any }) {
-        return fetch(`${ this.apiEndpoint }${ path }${ options.query ? new URLSearchParams(options.query) : "" }`, {
+        return fetch(`${this.apiEndpoint}${path}${options.query ? new URLSearchParams(options.query) : ""}`, {
             method,
             body: options.data,
             headers: {
-                Authorization: `Bearer ${ this.accessToken }`
+                Authorization: `Bearer ${this.accessToken}`
             }
         })
             .then(async response => {
                 const parsedBody = await response.json();
-                
+
                 if (!response.ok) {
-                    throw new Error(`Error sending request to ${ path }: Status ${ response.status } - ${ response.statusText || "N/A" }.`);
+                    throw new Error(`Error sending request to ${path}: Status ${response.status} - ${response.statusText || "N/A"}.`);
                 }
-                
+
                 return parsedBody;
             });
     }
-    
+
     /**
      * Logs in using the access token of a user through the given transport type
      * @param {string} accessToken
      * @returns {Promise<void>}
      */
-    async login (accessToken?: string) {
+    async login (accessToken?: string): Promise<PartialUser> {
         this.debugger(`Attempting to authenticate, waiting for socket to connect..`);
         await this.connect();
         this.debugger(`Socket connected, authenticating..`);
@@ -327,11 +357,14 @@ class DiscordRPCClient extends EventEmitter {
             access_token: accessToken || this.accessToken
         })
             .then(response => {
-                this.debugger(`Authentication response: ${ JSON.stringify(response) }`);
+                this.debugger(`Authentication response: ${JSON.stringify(response)}`);
+                this.user = response.user as PartialUser;
                 this.emit("ready");
+
+                return this.user;
             });
     }
-    
+
     /**
      * Sends a command to the currently connected socket
      * @param {RPCCommand} command
@@ -339,68 +372,68 @@ class DiscordRPCClient extends EventEmitter {
      * @param {RPCEvent} event
      * @returns {Promise<unknown>}
      */
-    sendCommand (command: RPCCommand, args: any, event?: RPCEvent): Promise<void> {
-        this.debugger(`Send Command: ${ command }, args: ${ JSON.stringify(args) }, event: ${ event }`);
-        
+    sendCommand (command: RPCCommand, args: any, event?: RPCEvent): Promise<any> {
+        this.debugger(`Send Command: ${command}, args: ${JSON.stringify(args)}, event: ${event}`);
+
         return new Promise((resolve, reject) => {
             const generatedNonce = uuid4122();
-            
+
             this.transport.send({
                 cmd: command,
                 args,
                 evt: event || undefined,
                 nonce: generatedNonce
             });
-            
+
             this.pendingResponses.set(generatedNonce, {
                 resolve,
                 reject
             });
         });
     }
-    
+
     subscribe (event: RPCEvent, args: any): Promise<void> {
-        this.debugger(`Subscribing to "${ event }"`);
+        this.debugger(`Subscribing to "${event}"`);
         return this.sendCommand(RPCCommands.SUBSCRIBE, args, event)
             .then(() => {
-                this.debugger(`Sent command to subscribe to event "${ event }"`);
+                this.debugger(`Sent command to subscribe to event "${event}"`);
             });
     }
-    
+
     getGuild (id: string, timeout?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.GET_GUILD, {
             guild_id: id,
             timeout: timeout || 10000
         });
     }
-    
+
     getGuilds (timeout?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.GET_GUILDS, {
             timeout: timeout || 10000
         });
     }
-    
+
     getChannel (id: string, timeout?: number): Promise<unknown> {
-        return this.sendCommand(RPCCommands.GET_CHANNELS, {
+        return this.sendCommand(RPCCommands.GET_CHANNEL, {
             channel_id: id,
             timeout: timeout || 10000
         });
     }
-    
-    getChannelsInGuild (guildId: string, timeout?: number): Promise<unknown> {
+
+    getChannels (guildId: string, timeout?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.GET_CHANNELS, {
             guild_id: guildId,
             timeout: timeout || 10000
         });
     }
-    
+
     setUserVoiceSettings (userId: string, settings: UserVoiceSettings): Promise<unknown> {
         return this.sendCommand(RPCCommands.SET_USER_VOICE_SETTINGS, {
             user_id: userId,
             ...settings
         });
     }
-    
+
     selectVoiceChannel (id: string, force?: boolean, timeout?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.SELECT_VOICE_CHANNEL, {
             channel_id: id,
@@ -408,23 +441,110 @@ class DiscordRPCClient extends EventEmitter {
             timeout: timeout || 10000
         });
     }
-    
+
     selectTextChannel (id: string, timeout?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.SELECT_TEXT_CHANNEL, {
             channel_id: id,
             timeout: timeout || 10000
         });
     }
-    
-    getVoiceSettings () {
+
+    sendJoinInvite (userId: string): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SEND_ACTIVITY_JOIN_INVITE, {
+            user_id: userId
+        });
+    }
+
+    sendJoinRequest (userId: string): Promise<unknown> {
+        return this.sendCommand(RPCCommands.CLOSE_ACTIVITY_JOIN_REQUEST, {
+            user_id: userId
+        });
+    }
+
+    closeJoinRequest (userId: string): Promise<unknown> {
+        return this.sendCommand(RPCCommands.CLOSE_ACTIVITY_JOIN_REQUEST, {
+            user_id: userId
+        });
+    }
+
+    createLobby (type: unknown, capacity: unknown, metadata: unknown): Promise<unknown> {
+        return this.sendCommand(RPCCommands.CREATE_LOBBY, {
+            type,
+            capacity,
+            metadata
+        });
+    }
+
+    updateLobby (id: unknown, options: { type: unknown, owner: unknown, capacity: unknown, metadata: unknown }): Promise<unknown> {
+        return this.sendCommand(RPCCommands.UPDATE_LOBBY, {
+            id,
+            ...options
+        });
+    }
+
+    deleteLobby (id: unknown): Promise<unknown> {
+        return this.sendCommand(RPCCommands.DELETE_LOBBY, {
+            id
+        });
+    }
+
+    connectToLobby (id: unknown, secret: string): Promise<unknown> {
+        return this.sendCommand(RPCCommands.CONNECT_TO_LOBBY, {
+            id,
+            secret
+        });
+    }
+
+    sendToLobby (id: unknown, data: unknown): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SEND_TO_LOBBY, {
+            id,
+            data
+        });
+    }
+
+    disconnectFromLobby (id: unknown): Promise<unknown> {
+        return this.sendCommand(RPCCommands.DISCONNECT_FROM_LOBBY, {
+            id
+        });
+    }
+
+    updateLobbyMember (lobbyId: unknown, userId: unknown, metadata: unknown): Promise<unknown> {
+        return this.sendCommand(RPCCommands.UPDATE_LOBBY_MEMBER, {
+            lobby_id: lobbyId,
+            user_id: userId,
+            metadata
+        });
+    }
+
+    getRelationships (): Promise<unknown> {
+        const types = Object.keys(RelationshipTypes);
+
+        return this.sendCommand(RPCCommands.GET_RELATIONSHIPS, {})
+            .then(response => response.relationships.map((relation: any) => ({
+                ...relation,
+                type: types[relation.type]
+            })));
+    }
+
+    getVoiceSettings (): Promise<VoiceSettings> {
         return this.sendCommand(RPCCommands.GET_VOICE_SETTINGS, {})
             .then(result => {
                 this.debugger(result);
-                return togglePhraseInObject("camel", result as unknown as Record<any, any>);
+                return togglePhraseInObject("camel", result as unknown as Record<any, any>) as VoiceSettings;
             });
     }
-    
-    public setActivity (activity: ActivityOptions, pid?: number): Promise<unknown> {
+
+    setVoiceSettings (settings: VoiceSettings): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SET_USER_VOICE_SETTINGS, togglePhraseInObject("snake", settings));
+    }
+
+    clearActivity (pid = getPID()): Promise<unknown> {
+        return this.sendCommand(RPCCommands.SET_ACTIVITY, {
+            pid
+        });
+    }
+
+    setActivity (activity: ActivityOptions, pid?: number): Promise<unknown> {
         return this.sendCommand(RPCCommands.SET_ACTIVITY, {
             pid: pid || getPID() || 1,
             activity: {
@@ -434,14 +554,18 @@ class DiscordRPCClient extends EventEmitter {
                 assets: togglePhraseInObject("snake", activity.assets || {}),
                 party: activity.party ? {
                     id: activity.party.id,
-                    size: [ activity.party.size, activity.party.max ]
+                    size: [activity.party.size, activity.party.max]
                 } : undefined,
                 secrets: activity.secrets,
                 instance: activity.instance
             }
         });
     }
-    
+
+    async destroy (): Promise<void> {
+        await this.transport.close();
+    }
+
     /**
      * Internal handling of RPC messages received
      * @param message
@@ -453,19 +577,19 @@ class DiscordRPCClient extends EventEmitter {
             if (message.data && message.data.user) {
                 this.user = message.data.user;
             }
-            
+
             // We're connected :)
             this.emit("connected");
         } else if (this.pendingResponses.has(message.nonce)) {
-            this.debugger(`Incoming message had pending response handler, nonce: ${ message.nonce }`);
+            this.debugger(`Incoming message had pending response handler, nonce: ${message.nonce}`);
             const foundResponseHandler = this.pendingResponses.get(message.nonce);
-            
+
             if (message.evt === "ERROR") {
                 const createdError = new Error(message.data.message);
-                
+
                 return foundResponseHandler!.reject(createdError);
             }
-            
+
             foundResponseHandler!.resolve(message.data);
         } else {
             this.emit(message.evt as RPCEvent, message.data);
