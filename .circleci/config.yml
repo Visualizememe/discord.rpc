@@ -1,7 +1,6 @@
 version: 2.1
 orbs:
   node: circleci/node@1.1.6
-  codecov: codecov/codecov@1.0.2
 jobs:
   build-and-test:
     executor:
@@ -14,9 +13,6 @@ jobs:
             - run: npm install jest --save-dev
             - run: npm run build
             - run: npm run tests
-      - codecov/upload:
-          file: "./coverage/clover.xml"
-          token: bc55e615-594b-40a3-bf51-3e408a8e5f85
 workflows:
   build-and-test:
     jobs:
