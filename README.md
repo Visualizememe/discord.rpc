@@ -54,6 +54,27 @@ Please, before making an issue or pull request, please make sure you have done t
 
 Check out below for some examples of how to use discord.rpc!
 
+```typescript
+import { DiscordRPCClient } from "discord.rpc";
+
+const client = new DiscordRPCClient({
+    transport: "ipc",
+    clientId: "abc",
+    accessToken: "cba"
+});
+
+client.login()
+    .then(async () => {
+        await client.subscribe("MESSAGE_CREATE", {
+            channel_id: "channelId"
+        });
+    
+        client.on("MESSAGE_CREATE", data => {
+            console.log(`New message: ${data.message.content}`);
+        });
+    });
+```
+
 ---
 
 ## License
